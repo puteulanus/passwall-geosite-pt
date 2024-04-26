@@ -217,87 +217,96 @@ func authenticateAndFetchJSON(urlWithCred, path string, target interface{}) erro
 }
 
 func main() {
-	flag.Parse()
+    flag.Parse()
 
-	if len(*qb) == 0 && len(*tr) == 0 {
-		fmt.Println("At least one qb or tr parameter must be specified.")
-		flag.Usage()
-		return
-	}
+    if len(*qb) == 0 && len(*tr) == 0 {
+        fmt.Println("At least one qb or tr parameter must be specified.")
+        flag.Usage()
+        return
+    }
 
-	domainSet := make(map[string]bool)
+    domainSet := make(map[string]bool)
+    errorOccurred := false // Flag to indicate if an error has occurred
 
-	// Process qBittorrent URLs
-	for _, qbURL := range *qb {
-		var torrents []TorrentInfo
-		err := authenticateAndFetchJSON(qbURL, "/torrents/info", &torrents)
-		if err != nil {
-			fmt.Printf("Error fetching torrents from qBittorrent at %s: %v\n", qbURL, err)
-			continue
-		}
+    // Process qBittorrent URLs
+    for _, qbURL := range *qb {
+        var torrents []TorrentInfo
+        err := authenticateAndFetchJSON(qbURL, "/torrents/info", &torrents)
+        if err != nil {
+            fmt.Printf("Error fetching torrents from qBittorrent at %s: %v\n", qbURL, err)
+            errorOccurred = true // Set error flag
+            continue
+        }
 
-		for _, torrent := range torrents {
-			var properties TorrentProperties
-			err := authenticateAndFetchJSON(qbURL, fmt.Sprintf("/torrents/properties?hash=%s", torrent.Hash), &properties)
-			if err != nil {
-				continue
-			}
+        for _, torrent := range torrents {
+            var properties TorrentProperties
+            err := authenticateAndFetchJSON(qbURL, fmt.Sprintf("/torrents/properties?hash=%s", torrent.Hash), &properties)
+            if err != nil {
+                continue
+            }
 
-			if properties.IsPrivate {
-				var trackers []Tracker
-				err := authenticateAndFetchJSON(qbURL, fmt.Sprintf("/torrents/trackers?hash=%s", torrent.Hash), &trackers)
-				if err != nil {
-					continue
-				}
+            if properties.IsPrivate {
+                var trackers []Tracker
+                err := authenticateAndFetchJSON(qbURL, fmt.Sprintf("/torrents/trackers?hash=%s", torrent.Hash), &trackers)
+                if err != nil {
+                    continue
+                }
 
-				for _, tracker := range trackers {
-					u, err := url.Parse(tracker.Url)
-					if err != nil {
-						continue
-					}
-					if u.Hostname() != "" {
-						domainSet[u.Hostname()] = true
-					}
-				}
-			}
-		}
-	}
+                for _, tracker := range trackers {
+                    u, err := url.Parse(tracker.Url)
+                    if err != nil {
+                        continue
+                    }
+                    if u.Hostname() != "" {
+                        domainSet[u.Hostname()] = true
+                    }
+                }
+            }
+        }
+    }
 
-	// Process Transmission URLs
-	for _, trURL := range *tr {
-		domains, err := fetchDomainsFromTR(trURL)
-		if err != nil {
-			fmt.Printf("Error fetching domains from Transmission at %s: %v\n", trURL, err)
-			continue
-		}
-		for _, domain := range domains {
-			domainSet[domain.Value] = true
-		}
-	}
+    // Process Transmission URLs
+    for _, trURL := range *tr {
+        domains, err := fetchDomainsFromTR(trURL)
+        if err != nil {
+            fmt.Printf("Error fetching domains from Transmission at %s: %v\n", trURL, err)
+            errorOccurred = true // Set error flag
+            continue
+        }
+        for _, domain := range domains {
+            domainSet[domain.Value] = true
+        }
+    }
 
-	// Generate and save the GeoSiteList
-	domains := make([]*router.Domain, 0, len(domainSet))
-	for domain := range domainSet {
-		domains = append(domains, &router.Domain{Type: router.Domain_Domain, Value: domain})
-	}
-	sort.Slice(domains, func(i, j int) bool { return domains[i].Value < domains[j].Value })
+    // Check if an error occurred and skip writing the file
+    if errorOccurred {
+        fmt.Println("Errors occurred during domain fetching; file write skipped.")
+        return
+    }
 
-	geoSiteList := &router.GeoSiteList{Entry: []*router.GeoSite{{CountryCode: "tracker", Domain: domains}}}
-	data, err := proto.Marshal(geoSiteList)
-	if err != nil {
-		fmt.Println("Failed to marshal GeoSiteList:", err)
-		return
-	}
+    // Generate and save the GeoSiteList
+    domains := make([]*router.Domain, 0, len(domainSet))
+    for domain := range domainSet {
+        domains = append(domains, &router.Domain{Type: router.Domain_Domain, Value: domain})
+    }
+    sort.Slice(domains, func(i, j int) bool { return domains[i].Value < domains[j].Value })
 
-	if err := ioutil.WriteFile(*datPath, data, 0666); err != nil {
-		fmt.Println("Failed to write file:", err)
-		return
-	}
+    geoSiteList := &router.GeoSiteList{Entry: []*router.GeoSite{{CountryCode: "tracker", Domain: domains}}}
+    data, err := proto.Marshal(geoSiteList)
+    if err != nil {
+        fmt.Println("Failed to marshal GeoSiteList:", err)
+        return
+    }
 
-	fmt.Printf("tracker -> %s\n", *datPath)
-	for _, domain := range domains {
-		fmt.Println(domain.Value)
-	}
+    if err := ioutil.WriteFile(*datPath, data, 0666); err != nil {
+        fmt.Println("Failed to write file:", err)
+        return
+    }
+
+    fmt.Printf("tracker -> %s\n", *datPath)
+    for _, domain := range domains {
+        fmt.Println(domain.Value)
+    }
 }
 
 func init() {
