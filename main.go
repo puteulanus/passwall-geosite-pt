@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -8,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strings"
+	"bytes"
 
 	"github.com/gogo/protobuf/proto"
 	"v2ray.com/core/app/router"
@@ -15,50 +18,196 @@ import (
 
 var (
 	datPath = flag.String("dat", "/usr/share/v2ray/pt.dat", "The path where the .dat file will be written")
-	apiBase = flag.String("api", "", "The base URL to the qBittorrent API (e.g., 192.168.1.1:8080)")
-	username = flag.String("user", "admin", "The username for qBittorrent API")
-	password = flag.String("pass", "adminadmin", "The password for qBittorrent API")
+	qb      = newMultiString("qb", "qBittorrent API credentials and URL (e.g., admin:adminadmin@192.168.1.1:8080)")
+	tr      = newMultiString("tr", "Transmission RPC credentials and URL (e.g., user:password@192.168.1.1:9091)")
 )
+
+type multiString []string
+
+func (m *multiString) String() string {
+	return fmt.Sprintf("%v", *m)
+}
+
+func (m *multiString) Set(value string) error {
+	*m = append(*m, value)
+	return nil
+}
+
+func newMultiString(name string, usage string) *[]string {
+	var s []string
+	flag.Var((*multiString)(&s), name, usage)
+	return &s
+}
+
+// Transmission-specific types
+type Tracker struct {
+	Announce string `json:"announce"`
+	Url string `json:"url"`
+}
 
 type TorrentInfo struct {
 	Hash string `json:"hash"`
-}
-
-type Tracker struct {
-	Url string `json:"url"`
 }
 
 type TorrentProperties struct {
 	IsPrivate bool `json:"is_private"`
 }
 
-func authenticate(client *http.Client, baseURL string) (*http.Cookie, error) {
-	resp, err := client.PostForm(baseURL+"/auth/login", url.Values{"username": {*username}, "password": {*password}})
+type Torrent struct {
+	Trackers []Tracker `json:"trackers"`
+}
+
+type TorrentsFetchResponse struct {
+	Arguments struct {
+		Torrents []Torrent `json:"torrents"`
+	} `json:"arguments"`
+}
+
+// Helper function to fetch session ID and retry request with session ID
+func getSessionIDAndRetry(req *http.Request, client *http.Client) (*http.Response, error) {
+    // 读取并保存原始 Body 数据
+    bodyData, err := ioutil.ReadAll(req.Body)
+    if err != nil {
+        return nil, err
+    }
+    req.Body.Close() // 关闭原始 Body
+
+    // 重新设置 Body
+    req.Body = ioutil.NopCloser(bytes.NewReader(bodyData))
+
+    // 发送请求
+    resp, err := client.Do(req)
+    if err != nil {
+        return nil, err
+    }
+
+    if resp.StatusCode == 409 {
+        // 读取 session ID 并设置
+        sessionID := resp.Header.Get("X-Transmission-Session-Id")
+        req.Header.Set("X-Transmission-Session-Id", sessionID)
+        resp.Body.Close() // 关闭前一个响应的 Body 以避免资源泄漏
+
+        // 重置 Body 以重新发送请求
+        req.Body = ioutil.NopCloser(bytes.NewReader(bodyData))
+
+        // 再次尝试发送请求
+        resp, err = client.Do(req)
+        if err != nil {
+            return nil, err
+        }
+    }
+
+    return resp, err
+}
+
+func fetchDomainsFromTR(urlWithCred string) ([]*router.Domain, error) {
+    parts := strings.Split(urlWithCred, "@")
+    if len(parts) != 2 {
+        return nil, fmt.Errorf("invalid transmission parameter format")
+    }
+    creds, baseURL := parts[0], "http://" + parts[1] + "/transmission/rpc"
+    authHeader := "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
+
+    client := &http.Client{}
+    jsonData := `{"method":"torrent-get","arguments":{"fields":["id","name","trackers"]}}`
+    req, err := http.NewRequest("POST", baseURL, strings.NewReader(jsonData))
+    if err != nil {
+        return nil, err
+    }
+    req.Header.Set("Authorization", authHeader)
+    req.Header.Set("Content-Type", "application/json")
+    //req.Header.Set("Content-Length", fmt.Sprintf("%d", len(jsonData)))
+
+    resp, err := getSessionIDAndRetry(req, client)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != 200 {
+        return nil, fmt.Errorf("request failed with status: %s", resp.Status)
+    }
+
+    var response TorrentsFetchResponse
+    if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+        return nil, err
+    }
+
+    domains := make([]*router.Domain, 0)
+    for _, torrent := range response.Arguments.Torrents {
+        privateTrackerFound := true
+        for _, tracker := range torrent.Trackers {
+            if !isPrivateTracker(tracker.Announce) {
+                privateTrackerFound = false
+                break
+            }
+        }
+        if privateTrackerFound {
+            for _, tracker := range torrent.Trackers {
+                parsedUrl, err := url.Parse(tracker.Announce)
+                if err != nil || parsedUrl.Hostname() == "" {
+                    continue
+                }
+                domains = append(domains, &router.Domain{Type: router.Domain_Domain, Value: parsedUrl.Hostname()})
+            }
+        }
+    }
+    return domains, nil
+}
+
+func isPrivateTracker(announceURL string) bool {
+	parsedUrl, err := url.Parse(announceURL)
 	if err != nil {
-		return nil, err
+		return false
+	}
+	return (parsedUrl.Scheme == "http" || parsedUrl.Scheme == "https") && parsedUrl.RawQuery != ""
+}
+
+func authenticateAndFetchJSON(urlWithCred, path string, target interface{}) error {
+	// Split the credentials and URL
+	parts := strings.Split(urlWithCred, "@")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid parameter format")
+	}
+	creds, baseURL := parts[0], "http://"+parts[1]+"/api/v2"
+
+	// Split username and password
+	usernamePassword := strings.Split(creds, ":")
+	if len(usernamePassword) != 2 {
+		return fmt.Errorf("invalid credentials format")
+	}
+
+	// Setup HTTP client
+	client := &http.Client{}
+	resp, err := client.PostForm(baseURL+"/auth/login", url.Values{"username": {usernamePassword[0]}, "password": {usernamePassword[1]}})
+	if err != nil {
+		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("authentication failed with status: %s", resp.Status)
+		return fmt.Errorf("authentication failed with status: %s", resp.Status)
 	}
 
-	for _, cookie := range resp.Cookies() {
-		if cookie.Name == "SID" {
-			return cookie, nil
+	cookie := ""
+	for _, c := range resp.Cookies() {
+		if c.Name == "SID" {
+			cookie = c.Value
+			break
 		}
 	}
-	return nil, fmt.Errorf("SID cookie not found")
-}
+	if cookie == "" {
+		return fmt.Errorf("SID cookie not found")
+	}
 
-func fetchJSON(client *http.Client, endpoint string, target interface{}, cookie *http.Cookie, baseURL string) error {
-	req, err := http.NewRequest("GET", baseURL+endpoint, nil)
+	// Fetch JSON data
+	req, err := http.NewRequest("GET", baseURL+path, nil)
 	if err != nil {
 		return err
 	}
-	req.AddCookie(cookie)
+	req.AddCookie(&http.Cookie{Name: "SID", Value: cookie})
 
-	resp, err := client.Do(req)
+	resp, err = client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -70,92 +219,82 @@ func fetchJSON(client *http.Client, endpoint string, target interface{}, cookie 
 func main() {
 	flag.Parse()
 
-	if *apiBase == "" {
-		fmt.Println("API base URL is required.")
+	if len(*qb) == 0 && len(*tr) == 0 {
+		fmt.Println("At least one qb or tr parameter must be specified.")
 		flag.Usage()
 		return
 	}
 
-	client := &http.Client{}
-	baseURL := "http://" + *apiBase + "/api/v2"
-
-	// Authenticate
-	cookie, err := authenticate(client, baseURL)
-	if err != nil {
-		fmt.Println("Error authenticating:", err)
-		return
-	}
-
 	domainSet := make(map[string]bool)
-	// Fetch torrents
-	var torrents []TorrentInfo
-	err = fetchJSON(client, "/torrents/info", &torrents, cookie, baseURL)
-	if err != nil {
-		fmt.Println("Error fetching torrents:", err)
-		return
-	}
 
-	for _, torrent := range torrents {
-		var properties TorrentProperties
-		err := fetchJSON(client, fmt.Sprintf("/torrents/properties?hash=%s", torrent.Hash), &properties, cookie, baseURL)
+	// Process qBittorrent URLs
+	for _, qbURL := range *qb {
+		var torrents []TorrentInfo
+		err := authenticateAndFetchJSON(qbURL, "/torrents/info", &torrents)
 		if err != nil {
-			fmt.Println("Error fetching properties for torrent:", err)
+			fmt.Printf("Error fetching torrents from qBittorrent at %s: %v\n", qbURL, err)
 			continue
 		}
 
-		if properties.IsPrivate {
-			var trackers []Tracker
-			err := fetchJSON(client, fmt.Sprintf("/torrents/trackers?hash=%s", torrent.Hash), &trackers, cookie, baseURL)
+		for _, torrent := range torrents {
+			var properties TorrentProperties
+			err := authenticateAndFetchJSON(qbURL, fmt.Sprintf("/torrents/properties?hash=%s", torrent.Hash), &properties)
 			if err != nil {
-				fmt.Println("Error fetching trackers for torrent:", err)
 				continue
 			}
 
-			for _, tracker := range trackers {
-				u, err := url.Parse(tracker.Url)
+			if properties.IsPrivate {
+				var trackers []Tracker
+				err := authenticateAndFetchJSON(qbURL, fmt.Sprintf("/torrents/trackers?hash=%s", torrent.Hash), &trackers)
 				if err != nil {
-					fmt.Println("Error parsing tracker URL:", err)
 					continue
 				}
-				if u.Hostname() != "" {
-					domainSet[u.Hostname()] = true
+
+				for _, tracker := range trackers {
+					u, err := url.Parse(tracker.Url)
+					if err != nil {
+						continue
+					}
+					if u.Hostname() != "" {
+						domainSet[u.Hostname()] = true
+					}
 				}
 			}
 		}
 	}
 
-	domains := make([]*router.Domain, 0)
+	// Process Transmission URLs
+	for _, trURL := range *tr {
+		domains, err := fetchDomainsFromTR(trURL)
+		if err != nil {
+			fmt.Printf("Error fetching domains from Transmission at %s: %v\n", trURL, err)
+			continue
+		}
+		for _, domain := range domains {
+			domainSet[domain.Value] = true
+		}
+	}
+
+	// Generate and save the GeoSiteList
+	domains := make([]*router.Domain, 0, len(domainSet))
 	for domain := range domainSet {
 		domains = append(domains, &router.Domain{Type: router.Domain_Domain, Value: domain})
 	}
-	sort.Slice(domains, func(i, j int) bool {
-		return domains[i].Value < domains[j].Value
-	})
+	sort.Slice(domains, func(i, j int) bool { return domains[i].Value < domains[j].Value })
 
-	// Create GeoSiteList and marshal to protobuf
-	geoSiteList := &router.GeoSiteList{
-		Entry: []*router.GeoSite{
-			{
-				CountryCode: "PT",
-				Domain:      domains,
-			},
-		},
-	}
-
+	geoSiteList := &router.GeoSiteList{Entry: []*router.GeoSite{{CountryCode: "tracker", Domain: domains}}}
 	data, err := proto.Marshal(geoSiteList)
 	if err != nil {
 		fmt.Println("Failed to marshal GeoSiteList:", err)
 		return
 	}
 
-	// Write to file
-	err = ioutil.WriteFile(*datPath, data, 0666)
-	if err != nil {
+	if err := ioutil.WriteFile(*datPath, data, 0666); err != nil {
 		fmt.Println("Failed to write file:", err)
 		return
 	}
 
-	fmt.Printf("PT -> %s\n", *datPath)
+	fmt.Printf("tracker -> %s\n", *datPath)
 	for _, domain := range domains {
 		fmt.Println(domain.Value)
 	}
@@ -165,7 +304,7 @@ func init() {
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage of %s:\n", "passwall-geosite-pt")
 		fmt.Println("Example:")
-		fmt.Println("./passwall-geosite-pt -api 192.168.1.1:8080 -user admin -pass adminadmin -dat /usr/share/v2ray/pt.dat")
+		fmt.Println("./passwall-geosite-pt -qb admin:adminadmin@192.168.1.1:8080 -tr user:password@192.168.1.1:9091")
 		flag.PrintDefaults()
 	}
 }
