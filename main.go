@@ -291,7 +291,7 @@ func main() {
     }
     sort.Slice(domains, func(i, j int) bool { return domains[i].Value < domains[j].Value })
 
-    geoSiteList := &router.GeoSiteList{Entry: []*router.GeoSite{{CountryCode: "tracker", Domain: domains}}}
+    geoSiteList := &router.GeoSiteList{Entry: []*router.GeoSite{{CountryCode: "TRACKER", Domain: domains}}}
     data, err := proto.Marshal(geoSiteList)
     if err != nil {
         fmt.Println("Failed to marshal GeoSiteList:", err)
