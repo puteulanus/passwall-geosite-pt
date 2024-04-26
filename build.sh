@@ -23,7 +23,7 @@ for platform in "${PLATFORMS[@]}"; do
     fi
 
     echo "Building for $GOOS/$GOARCH..."
-    env GOOS=$GOOS GOARCH=$GOARCH go build -o "build/$OUTPUT_NAME"
+    env CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -o "build/$OUTPUT_NAME"
 done
 
 echo "Build completed."
