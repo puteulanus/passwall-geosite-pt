@@ -1,0 +1,7 @@
+tasks:
+  - name: Setup Go Environment
+    init: >
+      go mod download
+  - name: Build Project
+    command: >
+      ./build.sh
