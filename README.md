@@ -19,4 +19,4 @@ ext:pt.dat:tracker
 
 Changed from https://github.com/gamesofts/v2ray-custom-geo
 
-Build your own https://gitpod.io/#github.com/puteulanus/passwall-geosite-pt
+Build your own binary https://gitpod.io/#github.com/puteulanus/passwall-geosite-pt
