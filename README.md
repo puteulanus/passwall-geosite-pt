@@ -1,5 +1,5 @@
-# passwall-geosite-pt
-Create xray geosite file by fetching domains from qbittorrent and transmission
+## Introduction
+**passwall-geosite-pt** is a utility designed to extract tracker domain names from torrents within qBittorrent and Transmission, and generate geosite files compatible with Xray (Passwall). This allows for the easy configuration of direct connections to trackers in Passwall rules. For qBittorrent, only the HTTP and HTTPS trackers of private seeds are retrieved. Due to API constraints in Transmission, all HTTP and HTTPS trackers, including those from BT seeds, are included. 
 
 ## Usage
 ```
