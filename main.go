@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"bytes"
+    "net"
 
 	"github.com/gogo/protobuf/proto"
 	"v2ray.com/core/app/router"
@@ -134,33 +135,22 @@ func fetchDomainsFromTR(urlWithCred string) ([]*router.Domain, error) {
     }
 
     domains := make([]*router.Domain, 0)
+
     for _, torrent := range response.Arguments.Torrents {
-        privateTrackerFound := true
         for _, tracker := range torrent.Trackers {
-            if !isPrivateTracker(tracker.Announce) {
-                privateTrackerFound = false
-                break
+            parsedUrl, err := url.Parse(tracker.Announce)
+            // 确保解析无误且 URL 协议是以 "http" 开头，且主机名非空，且主机名不是 IP 地址
+            if err != nil || 
+               !strings.HasPrefix(parsedUrl.Scheme, "http") || 
+               parsedUrl.Hostname() == "" || 
+               net.ParseIP(parsedUrl.Hostname()) != nil {
+                continue
             }
-        }
-        if privateTrackerFound {
-            for _, tracker := range torrent.Trackers {
-                parsedUrl, err := url.Parse(tracker.Announce)
-                if err != nil || parsedUrl.Hostname() == "" {
-                    continue
-                }
-                domains = append(domains, &router.Domain{Type: router.Domain_Domain, Value: parsedUrl.Hostname()})
-            }
+            domains = append(domains, &router.Domain{Type: router.Domain_Domain, Value: parsedUrl.Hostname()})
         }
     }
-    return domains, nil
-}
 
-func isPrivateTracker(announceURL string) bool {
-	parsedUrl, err := url.Parse(announceURL)
-	if err != nil {
-		return false
-	}
-	return (parsedUrl.Scheme == "http" || parsedUrl.Scheme == "https") && parsedUrl.RawQuery != ""
+    return domains, nil
 }
 
 func authenticateAndFetchJSON(urlWithCred, path string, target interface{}) error {

@@ -3,6 +3,9 @@
 # 确保脚本出错时终止
 set -e
 
+# 删除存在的构建
+rm -rf build
+
 # 定义编译目标平台
 PLATFORMS=("darwin/amd64" "darwin/arm64" "linux/amd64" "linux/arm64")
 
